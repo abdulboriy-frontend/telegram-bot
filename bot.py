@@ -3,7 +3,9 @@ import re
 import asyncio
 import logging
 import urllib.request
+import urllib.parse
 import json
+import tempfile
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -13,7 +15,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "83a6838fa5mshb0763b50baee654p1b6a32jsn083c8022623e")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_BYTES = 49 * 1024 * 1024
@@ -30,28 +32,90 @@ def detect(url):
     if FACEBOOK_RE.search(url): return "Facebook"
     return None
 
-def download_with_ytdlp(url, extra_opts=None):
-    out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    formats = [
-        "best[ext=mp4][height<=480]",
-        "best[ext=mp4]",
-        "best",
-    ]
-    opts_base = {
-        "outtmpl": out,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "prefer_ffmpeg": False,
-        "postprocessors": [],
+def download_file(url, filename):
+    """URL dan fayl yuklab olish"""
+    path = DOWNLOAD_DIR / filename
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
     }
-    if extra_opts:
-        opts_base.update(extra_opts)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        with open(path, "wb") as f:
+            f.write(r.read())
+    return path
+
+def download_tiktok_api(url):
+    """RapidAPI orqali TikTok video yuklash"""
+    try:
+        encoded_url = urllib.parse.quote(url, safe="")
+        api_url = f"https://tiktok-scraper7.p.rapidapi.com/video/info?url={encoded_url}"
+        
+        headers = {
+            "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
+            "x-rapidapi-key": RAPIDAPI_KEY,
+        }
+        
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read())
+        
+        if not data.get("data"):
+            return None, "Video topilmadi"
+        
+        video_data = data["data"]
+        
+        # Watermarksiz video URL
+        video_url = (
+            video_data.get("play") or
+            video_data.get("wmplay") or
+            video_data.get("download_addr", {}).get("url_list", [None])[0]
+        )
+        
+        if not video_url:
+            return None, "Video URL topilmadi"
+        
+        path = download_file(video_url, "tiktok_video.mp4")
+        return path, ""
+        
+    except Exception as e:
+        logger.error("TikTok API xato: %s", e)
+        return None, str(e)
+
+def download_youtube(url):
+    """pytubefix orqali YouTube video yuklash"""
+    try:
+        from pytubefix import YouTube
+        yt = YouTube(url)
+        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").last()
+        if not stream:
+            stream = yt.streams.filter(file_extension="mp4").first()
+        if stream:
+            path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
+            if path.exists() and path.stat().st_size > 0:
+                return path, ""
+    except Exception as e:
+        logger.warning("pytubefix xato: %s", e)
+    return None, "YouTube yuklab bolmadi"
+
+def download_ytdlp(url, platform):
+    """yt-dlp orqali video yuklash"""
+    out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
+    formats = ["best[ext=mp4][height<=480]", "best[ext=mp4]", "best"]
+    
+    headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"}
     
     for fmt in formats:
         try:
-            opts = dict(opts_base)
-            opts["format"] = fmt
+            opts = {
+                "outtmpl": out,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": fmt,
+                "prefer_ffmpeg": False,
+                "postprocessors": [],
+                "http_headers": headers,
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 vid_id = info.get("id", "")
@@ -65,59 +129,24 @@ def download_with_ytdlp(url, extra_opts=None):
                         return newest, ""
         except Exception as e:
             err = str(e)
-            if "private" in err.lower() or "login" in err.lower():
-                return None, "Bu video private"
-            if "unavailable" in err.lower():
-                return None, "Bu video mavjud emas"
+            if "private" in err.lower(): return None, "Bu video private"
+            if "unavailable" in err.lower(): return None, "Bu video mavjud emas"
             continue
     return None, "Yuklab bolmadi"
 
-def download_youtube(url):
-    # pytubefix bilan yuklaymiz
-    try:
-        from pytubefix import YouTube
-        from pytubefix.cli import on_progress
-        yt = YouTube(url, on_progress_callback=on_progress, use_oauth=False, allow_oauth_cache=False)
-        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").last()
-        if not stream:
-            stream = yt.streams.filter(file_extension="mp4").first()
-        if stream:
-            path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
-            if path.exists() and path.stat().st_size > 0:
-                return path, ""
-    except Exception as e:
-        logger.warning("pytubefix xato: %s", e)
-    
-    # yt-dlp bilan urinib ko'ramiz
-    return download_with_ytdlp(url)
-
-def download_tiktok(url):
-    # TikTok uchun maxsus headers
-    opts = {
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-            "Referer": "https://www.tiktok.com/",
-        }
-    }
-    return download_with_ytdlp(url, opts)
-
-def download_instagram(url):
-    opts = {
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
-        }
-    }
-    return download_with_ytdlp(url, opts)
-
 def download_sync(url, platform):
-    if platform == "YouTube":
-        return download_youtube(url)
-    elif platform == "TikTok":
-        return download_tiktok(url)
-    elif platform == "Instagram":
-        return download_instagram(url)
+    if platform == "TikTok":
+        path, err = download_tiktok_api(url)
+        if not err and path:
+            return path, ""
+        return download_ytdlp(url, platform)
+    elif platform == "YouTube":
+        path, err = download_youtube(url)
+        if not err and path:
+            return path, ""
+        return download_ytdlp(url, platform)
     else:
-        return download_with_ytdlp(url)
+        return download_ytdlp(url, platform)
 
 async def download_video(url, platform):
     loop = asyncio.get_event_loop()

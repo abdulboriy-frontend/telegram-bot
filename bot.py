@@ -2,10 +2,6 @@ import os
 import re
 import asyncio
 import logging
-import urllib.request
-import urllib.parse
-import json
-import tempfile
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -15,74 +11,19 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "83a6838fa5mshb0763b50baee654p1b6a32jsn083c8022623e")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_BYTES = 49 * 1024 * 1024
 
-INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-]+")
 YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w\-]+")
-TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.)?tiktok\.com/[\S]+")
-FACEBOOK_RE = re.compile(r"(https?://)?(www\.)?(facebook\.com|fb\.watch)/[\S]+")
+INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-]+")
 
 def detect(url):
-    if INSTAGRAM_RE.search(url): return "Instagram"
     if YOUTUBE_RE.search(url): return "YouTube"
-    if TIKTOK_RE.search(url): return "TikTok"
-    if FACEBOOK_RE.search(url): return "Facebook"
+    if INSTAGRAM_RE.search(url): return "Instagram"
     return None
 
-def download_file(url, filename):
-    """URL dan fayl yuklab olish"""
-    path = DOWNLOAD_DIR / filename
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-    }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        with open(path, "wb") as f:
-            f.write(r.read())
-    return path
-
-def download_tiktok_api(url):
-    """RapidAPI orqali TikTok video yuklash"""
-    try:
-        encoded_url = urllib.parse.quote(url, safe="")
-        api_url = f"https://tiktok-scraper7.p.rapidapi.com/video/info?url={encoded_url}"
-        
-        headers = {
-            "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
-            "x-rapidapi-key": RAPIDAPI_KEY,
-        }
-        
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-        
-        if not data.get("data"):
-            return None, "Video topilmadi"
-        
-        video_data = data["data"]
-        
-        # Watermarksiz video URL
-        video_url = (
-            video_data.get("play") or
-            video_data.get("wmplay") or
-            video_data.get("download_addr", {}).get("url_list", [None])[0]
-        )
-        
-        if not video_url:
-            return None, "Video URL topilmadi"
-        
-        path = download_file(video_url, "tiktok_video.mp4")
-        return path, ""
-        
-    except Exception as e:
-        logger.error("TikTok API xato: %s", e)
-        return None, str(e)
-
 def download_youtube(url):
-    """pytubefix orqali YouTube video yuklash"""
     try:
         from pytubefix import YouTube
         yt = YouTube(url)
@@ -97,13 +38,9 @@ def download_youtube(url):
         logger.warning("pytubefix xato: %s", e)
     return None, "YouTube yuklab bolmadi"
 
-def download_ytdlp(url, platform):
-    """yt-dlp orqali video yuklash"""
+def download_instagram(url):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    formats = ["best[ext=mp4][height<=480]", "best[ext=mp4]", "best"]
-    
-    headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"}
-    
+    formats = ["best[ext=mp4][height<=720]", "best[ext=mp4]", "best"]
     for fmt in formats:
         try:
             opts = {
@@ -114,7 +51,9 @@ def download_ytdlp(url, platform):
                 "format": fmt,
                 "prefer_ffmpeg": False,
                 "postprocessors": [],
-                "http_headers": headers,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+                },
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -131,22 +70,14 @@ def download_ytdlp(url, platform):
             err = str(e)
             if "private" in err.lower(): return None, "Bu video private"
             if "unavailable" in err.lower(): return None, "Bu video mavjud emas"
+            if "login" in err.lower(): return None, "Bu video private"
             continue
     return None, "Yuklab bolmadi"
 
 def download_sync(url, platform):
-    if platform == "TikTok":
-        path, err = download_tiktok_api(url)
-        if not err and path:
-            return path, ""
-        return download_ytdlp(url, platform)
-    elif platform == "YouTube":
-        path, err = download_youtube(url)
-        if not err and path:
-            return path, ""
-        return download_ytdlp(url, platform)
-    else:
-        return download_ytdlp(url, platform)
+    if platform == "YouTube":
+        return download_youtube(url)
+    return download_instagram(url)
 
 async def download_video(url, platform):
     loop = asyncio.get_event_loop()
@@ -163,19 +94,22 @@ async def download_video(url, platform):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Salom! Video Yuklovchi Bot!\n\n"
-        "Quyidagilardan havola yuboring:\n"
-        "• Instagram\n"
-        "• YouTube\n"
-        "• TikTok\n"
-        "• Facebook\n\n"
-        "Havola yuboring — yuklab beraman!"
+        "YouTube va Instagram havolalarini yuboring!\n\n"
+        "Misol:\n"
+        "https://youtu.be/VIDEO_ID\n"
+        "https://www.instagram.com/reel/ABC/"
     )
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     platform = detect(url)
     if not platform:
-        await update.message.reply_text("Faqat Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!")
+        await update.message.reply_text(
+            "Faqat YouTube va Instagram havolasi yuboring!\n\n"
+            "Misol:\n"
+            "https://youtu.be/VIDEO_ID\n"
+            "https://www.instagram.com/reel/ABC/"
+        )
         return
 
     status = await update.message.reply_text(f"{platform} yuklanmoqda... kuting...")
@@ -204,7 +138,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             path.unlink(missing_ok=True)
 
 async def other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!")
+    await update.message.reply_text(
+        "Faqat YouTube va Instagram havolasi yuboring!"
+    )
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":

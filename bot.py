@@ -23,28 +23,38 @@ def detect(url):
     if YOUTUBE_RE.search(url): return "YouTube"
     return None
 
-def download_sync(url, platform):
+def download_youtube(url):
+    try:
+        from pytubefix import YouTube
+        yt = YouTube(url)
+        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").last()
+        if not stream:
+            stream = yt.streams.filter(file_extension="mp4").first()
+        if stream:
+            path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
+            if path.exists() and path.stat().st_size > 0:
+                return path, ""
+    except Exception as e:
+        logger.warning("pytubefix xato: %s", e)
+    return None, "YouTube yuklab bolmadi"
+
+def download_instagram(url):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    formats = [
-        "best[ext=mp4][height<=480]",
-        "best[ext=mp4]",
-        "best",
-    ]
-    opts_base = {
-        "outtmpl": out,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "prefer_ffmpeg": False,
-        "postprocessors": [],
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
-        },
-    }
+    formats = ["best[ext=mp4][height<=720]", "best[ext=mp4]", "best"]
     for fmt in formats:
         try:
-            opts = dict(opts_base)
-            opts["format"] = fmt
+            opts = {
+                "outtmpl": out,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": fmt,
+                "prefer_ffmpeg": False,
+                "postprocessors": [],
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
+                },
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 vid_id = info.get("id", "")
@@ -64,6 +74,11 @@ def download_sync(url, platform):
                 return None, "Bu video mavjud emas"
             continue
     return None, "Yuklab bolmadi"
+
+def download_sync(url, platform):
+    if platform == "YouTube":
+        return download_youtube(url)
+    return download_instagram(url)
 
 async def download_video(url, platform):
     loop = asyncio.get_event_loop()

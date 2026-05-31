@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 import logging
+import urllib.request
+import json
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -11,75 +13,45 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_BYTES = 49 * 1024 * 1024
 
-URL_RE = re.compile(r"https?://[\S]+")
+INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-]+")
+YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w\-]+")
+TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.)?tiktok\.com/[\S]+")
+FACEBOOK_RE = re.compile(r"(https?://)?(www\.)?(facebook\.com|fb\.watch)/[\S]+")
 
-def is_supported(url):
-    patterns = [
-        r"instagram\.com/(p|reel|tv|stories)/",
-        r"(youtube\.com/(watch|shorts)|youtu\.be/)",
-        r"tiktok\.com/",
-        r"facebook\.com/",
-        r"fb\.watch/",
-    ]
-    return any(re.search(p, url) for p in patterns)
+def detect(url):
+    if INSTAGRAM_RE.search(url): return "Instagram"
+    if YOUTUBE_RE.search(url): return "YouTube"
+    if TIKTOK_RE.search(url): return "TikTok"
+    if FACEBOOK_RE.search(url): return "Facebook"
+    return None
 
-def get_platform(url):
-    if "instagram.com" in url: return "Instagram"
-    if "youtube.com" in url or "youtu.be" in url: return "YouTube"
-    if "tiktok.com" in url: return "TikTok"
-    if "facebook.com" in url or "fb.watch" in url: return "Facebook"
-    return "Video"
-
-def download_sync(url):
+def download_with_ytdlp(url, extra_opts=None):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    
-    # YouTube uchun pytubefix ishlatamiz
-    if "youtube.com" in url or "youtu.be" in url:
-        try:
-            from pytubefix import YouTube
-            yt = YouTube(url)
-            stream = (
-                yt.streams
-                .filter(progressive=True, file_extension="mp4")
-                .order_by("resolution")
-                .last()
-            )
-            if not stream:
-                stream = yt.streams.filter(file_extension="mp4").first()
-            if stream:
-                path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
-                if path.exists() and path.stat().st_size > 0:
-                    return path, ""
-        except Exception as e:
-            logger.warning("pytubefix xato: %s", e)
-
-    # Boshqa saytlar uchun yt-dlp
-    format_list = [
+    formats = [
         "best[ext=mp4][height<=480]",
-        "best[ext=mp4][height<=720]",
         "best[ext=mp4]",
         "best",
     ]
+    opts_base = {
+        "outtmpl": out,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "prefer_ffmpeg": False,
+        "postprocessors": [],
+    }
+    if extra_opts:
+        opts_base.update(extra_opts)
     
-    last_err = "Yuklab bolmadi"
-    for fmt in format_list:
+    for fmt in formats:
         try:
-            opts = {
-                "outtmpl": out,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "format": fmt,
-                "prefer_ffmpeg": False,
-                "postprocessors": [],
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
-                },
-            }
+            opts = dict(opts_base)
+            opts["format"] = fmt
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 vid_id = info.get("id", "")
@@ -94,30 +66,75 @@ def download_sync(url):
         except Exception as e:
             err = str(e)
             if "private" in err.lower() or "login" in err.lower():
-                return None, "Bu video private — yuklab bolmaydi"
+                return None, "Bu video private"
             if "unavailable" in err.lower():
                 return None, "Bu video mavjud emas"
-            last_err = err
             continue
-    
-    return None, last_err
+    return None, "Yuklab bolmadi"
 
-async def download_video(url):
+def download_youtube(url):
+    # pytubefix bilan yuklaymiz
+    try:
+        from pytubefix import YouTube
+        from pytubefix.cli import on_progress
+        yt = YouTube(url, on_progress_callback=on_progress, use_oauth=False, allow_oauth_cache=False)
+        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").last()
+        if not stream:
+            stream = yt.streams.filter(file_extension="mp4").first()
+        if stream:
+            path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
+            if path.exists() and path.stat().st_size > 0:
+                return path, ""
+    except Exception as e:
+        logger.warning("pytubefix xato: %s", e)
+    
+    # yt-dlp bilan urinib ko'ramiz
+    return download_with_ytdlp(url)
+
+def download_tiktok(url):
+    # TikTok uchun maxsus headers
+    opts = {
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+            "Referer": "https://www.tiktok.com/",
+        }
+    }
+    return download_with_ytdlp(url, opts)
+
+def download_instagram(url):
+    opts = {
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
+        }
+    }
+    return download_with_ytdlp(url, opts)
+
+def download_sync(url, platform):
+    if platform == "YouTube":
+        return download_youtube(url)
+    elif platform == "TikTok":
+        return download_tiktok(url)
+    elif platform == "Instagram":
+        return download_instagram(url)
+    else:
+        return download_with_ytdlp(url)
+
+async def download_video(url, platform):
     loop = asyncio.get_event_loop()
-    path, err = await loop.run_in_executor(None, download_sync, url)
+    path, err = await loop.run_in_executor(None, download_sync, url, platform)
     if err:
         return None, err
     if not path or not path.exists():
         return None, "Fayl topilmadi"
     if path.stat().st_size > MAX_BYTES:
         path.unlink(missing_ok=True)
-        return None, "Video 49MB dan katta. Qisqaroq video yuboring."
+        return None, "Video 49MB dan katta"
     return path, ""
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Men Video Yuklovchi Botman!\n\n"
-        "Quyidagi saytlardan havola yuboring:\n"
+        "Salom! Video Yuklovchi Bot!\n\n"
+        "Quyidagilardan havola yuboring:\n"
         "• Instagram\n"
         "• YouTube\n"
         "• TikTok\n"
@@ -126,24 +143,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    
-    if not URL_RE.search(text):
-        await update.message.reply_text("Havola yuboring!")
-        return
-    
-    url = URL_RE.search(text).group()
-    
-    if not is_supported(url):
-        await update.message.reply_text(
-            "Faqat Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!"
-        )
+    url = update.message.text.strip()
+    platform = detect(url)
+    if not platform:
+        await update.message.reply_text("Faqat Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!")
         return
 
-    platform = get_platform(url)
     status = await update.message.reply_text(f"{platform} yuklanmoqda... kuting...")
-    
-    path, err = await download_video(url)
+    path, err = await download_video(url, platform)
 
     if err:
         await status.edit_text(f"Xato: {err}")
@@ -162,16 +169,13 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.delete()
     except Exception as e:
         logger.error("Yuborishda xato: %s", e)
-        await status.edit_text("Yuborishda xato yuz berdi. Qayta urining.")
+        await status.edit_text("Yuborishda xato. Qayta urining.")
     finally:
         if path and path.exists():
             path.unlink(missing_ok=True)
 
 async def other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Havola yuboring!\n"
-        "Instagram, YouTube, TikTok, Facebook"
-    )
+    await update.message.reply_text("Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!")
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":

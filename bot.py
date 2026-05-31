@@ -15,46 +15,36 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_BYTES = 49 * 1024 * 1024
 
-YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w\-]+")
 INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-]+")
+YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w\-]+")
 
 def detect(url):
-    if YOUTUBE_RE.search(url): return "YouTube"
     if INSTAGRAM_RE.search(url): return "Instagram"
+    if YOUTUBE_RE.search(url): return "YouTube"
     return None
 
-def download_youtube(url):
-    try:
-        from pytubefix import YouTube
-        yt = YouTube(url)
-        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").last()
-        if not stream:
-            stream = yt.streams.filter(file_extension="mp4").first()
-        if stream:
-            path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
-            if path.exists() and path.stat().st_size > 0:
-                return path, ""
-    except Exception as e:
-        logger.warning("pytubefix xato: %s", e)
-    return None, "YouTube yuklab bolmadi"
-
-def download_instagram(url):
+def download_sync(url, platform):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    formats = ["best[ext=mp4][height<=720]", "best[ext=mp4]", "best"]
+    formats = [
+        "best[ext=mp4][height<=480]",
+        "best[ext=mp4]",
+        "best",
+    ]
+    opts_base = {
+        "outtmpl": out,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "prefer_ffmpeg": False,
+        "postprocessors": [],
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
+        },
+    }
     for fmt in formats:
         try:
-            opts = {
-                "outtmpl": out,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "format": fmt,
-                "prefer_ffmpeg": False,
-                "postprocessors": [],
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-                },
-            }
+            opts = dict(opts_base)
+            opts["format"] = fmt
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 vid_id = info.get("id", "")
@@ -68,16 +58,12 @@ def download_instagram(url):
                         return newest, ""
         except Exception as e:
             err = str(e)
-            if "private" in err.lower(): return None, "Bu video private"
-            if "unavailable" in err.lower(): return None, "Bu video mavjud emas"
-            if "login" in err.lower(): return None, "Bu video private"
+            if "private" in err.lower() or "login" in err.lower():
+                return None, "Bu video private"
+            if "unavailable" in err.lower():
+                return None, "Bu video mavjud emas"
             continue
     return None, "Yuklab bolmadi"
-
-def download_sync(url, platform):
-    if platform == "YouTube":
-        return download_youtube(url)
-    return download_instagram(url)
 
 async def download_video(url, platform):
     loop = asyncio.get_event_loop()
@@ -94,22 +80,17 @@ async def download_video(url, platform):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Salom! Video Yuklovchi Bot!\n\n"
-        "YouTube va Instagram havolalarini yuboring!\n\n"
+        "Instagram va YouTube havolalarini yuboring!\n\n"
         "Misol:\n"
-        "https://youtu.be/VIDEO_ID\n"
-        "https://www.instagram.com/reel/ABC/"
+        "https://www.instagram.com/reel/ABC/\n"
+        "https://youtu.be/VIDEO_ID"
     )
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     platform = detect(url)
     if not platform:
-        await update.message.reply_text(
-            "Faqat YouTube va Instagram havolasi yuboring!\n\n"
-            "Misol:\n"
-            "https://youtu.be/VIDEO_ID\n"
-            "https://www.instagram.com/reel/ABC/"
-        )
+        await update.message.reply_text("Faqat Instagram va YouTube havolasi yuboring!")
         return
 
     status = await update.message.reply_text(f"{platform} yuklanmoqda... kuting...")
@@ -138,9 +119,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             path.unlink(missing_ok=True)
 
 async def other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Faqat YouTube va Instagram havolasi yuboring!"
-    )
+    await update.message.reply_text("Faqat Instagram va YouTube havolasi yuboring!")
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":

@@ -15,27 +15,58 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_BYTES = 49 * 1024 * 1024
 
-INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-]+")
-YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w\-]+")
-TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.)?tiktok\.com/[\S]+")
+URL_RE = re.compile(r"https?://[\S]+")
 
-def detect(url):
-    if INSTAGRAM_RE.search(url): return "Instagram"
-    if YOUTUBE_RE.search(url): return "YouTube"
-    if TIKTOK_RE.search(url): return "TikTok"
-    return None
+def is_supported(url):
+    patterns = [
+        r"instagram\.com/(p|reel|tv|stories)/",
+        r"(youtube\.com/(watch|shorts)|youtu\.be/)",
+        r"tiktok\.com/",
+        r"facebook\.com/",
+        r"fb\.watch/",
+    ]
+    return any(re.search(p, url) for p in patterns)
+
+def get_platform(url):
+    if "instagram.com" in url: return "Instagram"
+    if "youtube.com" in url or "youtu.be" in url: return "YouTube"
+    if "tiktok.com" in url: return "TikTok"
+    if "facebook.com" in url or "fb.watch" in url: return "Facebook"
+    return "Video"
 
 def download_sync(url):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    # Faqat tayyor mp4 — ffmpeg shart emas
-    formats = [
-        "best[ext=mp4][height<=360]",
+    
+    # YouTube uchun pytubefix ishlatamiz
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            from pytubefix import YouTube
+            yt = YouTube(url)
+            stream = (
+                yt.streams
+                .filter(progressive=True, file_extension="mp4")
+                .order_by("resolution")
+                .last()
+            )
+            if not stream:
+                stream = yt.streams.filter(file_extension="mp4").first()
+            if stream:
+                path = Path(stream.download(output_path=str(DOWNLOAD_DIR)))
+                if path.exists() and path.stat().st_size > 0:
+                    return path, ""
+        except Exception as e:
+            logger.warning("pytubefix xato: %s", e)
+
+    # Boshqa saytlar uchun yt-dlp
+    format_list = [
         "best[ext=mp4][height<=480]",
+        "best[ext=mp4][height<=720]",
         "best[ext=mp4]",
-        "worst[ext=mp4]",
         "best",
     ]
-    for fmt in formats:
+    
+    last_err = "Yuklab bolmadi"
+    for fmt in format_list:
         try:
             opts = {
                 "outtmpl": out,
@@ -45,6 +76,9 @@ def download_sync(url):
                 "format": fmt,
                 "prefer_ffmpeg": False,
                 "postprocessors": [],
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
+                },
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -52,19 +86,21 @@ def download_sync(url):
                 for f in DOWNLOAD_DIR.iterdir():
                     if f.stem == vid_id:
                         return f, ""
-                # Eng yangi fayl
                 files = list(DOWNLOAD_DIR.iterdir())
                 if files:
-                    return max(files, key=lambda x: x.stat().st_mtime), ""
+                    newest = max(files, key=lambda x: x.stat().st_mtime)
+                    if newest.stat().st_size > 0:
+                        return newest, ""
         except Exception as e:
             err = str(e)
-            if "login" in err.lower() or "private" in err.lower():
-                return None, "Bu video private"
+            if "private" in err.lower() or "login" in err.lower():
+                return None, "Bu video private — yuklab bolmaydi"
             if "unavailable" in err.lower():
                 return None, "Bu video mavjud emas"
-            logger.warning("Format %s xato: %s", fmt, e)
+            last_err = err
             continue
-    return None, "Yuklab bolmadi"
+    
+    return None, last_err
 
 async def download_video(url):
     loop = asyncio.get_event_loop()
@@ -75,23 +111,38 @@ async def download_video(url):
         return None, "Fayl topilmadi"
     if path.stat().st_size > MAX_BYTES:
         path.unlink(missing_ok=True)
-        return None, "Video 49MB dan katta"
+        return None, "Video 49MB dan katta. Qisqaroq video yuboring."
     return path, ""
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Video Yuklovchi Bot!\n\n"
-        "Instagram, YouTube, TikTok havolalarini yuboring!"
+        "Salom! Men Video Yuklovchi Botman!\n\n"
+        "Quyidagi saytlardan havola yuboring:\n"
+        "• Instagram\n"
+        "• YouTube\n"
+        "• TikTok\n"
+        "• Facebook\n\n"
+        "Havola yuboring — yuklab beraman!"
     )
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    platform = detect(url)
-    if not platform:
-        await update.message.reply_text("Faqat Instagram, YouTube yoki TikTok havolasi yuboring!")
+    text = update.message.text.strip()
+    
+    if not URL_RE.search(text):
+        await update.message.reply_text("Havola yuboring!")
+        return
+    
+    url = URL_RE.search(text).group()
+    
+    if not is_supported(url):
+        await update.message.reply_text(
+            "Faqat Instagram, YouTube, TikTok yoki Facebook havolasi yuboring!"
+        )
         return
 
+    platform = get_platform(url)
     status = await update.message.reply_text(f"{platform} yuklanmoqda... kuting...")
+    
     path, err = await download_video(url)
 
     if err:
@@ -110,13 +161,17 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"Yuborishda xato: {e}")
+        logger.error("Yuborishda xato: %s", e)
+        await status.edit_text("Yuborishda xato yuz berdi. Qayta urining.")
     finally:
         if path and path.exists():
             path.unlink(missing_ok=True)
 
 async def other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Faqat Instagram, YouTube yoki TikTok havolasi yuboring!")
+    await update.message.reply_text(
+        "Havola yuboring!\n"
+        "Instagram, YouTube, TikTok, Facebook"
+    )
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":

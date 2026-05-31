@@ -25,45 +25,50 @@ def detect(url):
     if TIKTOK_RE.search(url): return "TikTok"
     return None
 
-def download_sync(url, platform):
+def download_sync(url):
     out = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
-    opts = {
-        "outtmpl": out,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "format": "bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-    }
-    if platform == "TikTok":
-        opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
-        }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            vid_id = info.get("id", "")
-            for f in DOWNLOAD_DIR.iterdir():
-                if f.stem == vid_id:
-                    return f, ""
-            fname = Path(ydl.prepare_filename(info))
-            if fname.exists():
-                return fname, ""
-            files = list(DOWNLOAD_DIR.iterdir())
-            if files:
-                return max(files, key=lambda f: f.stat().st_mtime), ""
-            return None, "Fayl topilmadi"
-    except Exception as e:
-        msg = str(e)
-        if "login" in msg.lower() or "private" in msg.lower():
-            return None, "Bu video private"
-        if "unavailable" in msg.lower():
-            return None, "Bu video mavjud emas"
-        return None, f"Xato: {msg[:150]}"
+    # Faqat tayyor mp4 — ffmpeg shart emas
+    formats = [
+        "best[ext=mp4][height<=360]",
+        "best[ext=mp4][height<=480]",
+        "best[ext=mp4]",
+        "worst[ext=mp4]",
+        "best",
+    ]
+    for fmt in formats:
+        try:
+            opts = {
+                "outtmpl": out,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": fmt,
+                "prefer_ffmpeg": False,
+                "postprocessors": [],
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                vid_id = info.get("id", "")
+                for f in DOWNLOAD_DIR.iterdir():
+                    if f.stem == vid_id:
+                        return f, ""
+                # Eng yangi fayl
+                files = list(DOWNLOAD_DIR.iterdir())
+                if files:
+                    return max(files, key=lambda x: x.stat().st_mtime), ""
+        except Exception as e:
+            err = str(e)
+            if "login" in err.lower() or "private" in err.lower():
+                return None, "Bu video private"
+            if "unavailable" in err.lower():
+                return None, "Bu video mavjud emas"
+            logger.warning("Format %s xato: %s", fmt, e)
+            continue
+    return None, "Yuklab bolmadi"
 
-async def download_video(url, platform):
+async def download_video(url):
     loop = asyncio.get_event_loop()
-    path, err = await loop.run_in_executor(None, download_sync, url, platform)
+    path, err = await loop.run_in_executor(None, download_sync, url)
     if err:
         return None, err
     if not path or not path.exists():
@@ -75,26 +80,34 @@ async def download_video(url, platform):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Men Video Yuklovchi Botman!\n\n"
-        "YouTube, Instagram, TikTok havolalarini yuboring!\n"
-        "Yuklab beraman!"
+        "Salom! Video Yuklovchi Bot!\n\n"
+        "Instagram, YouTube, TikTok havolalarini yuboring!"
     )
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     platform = detect(url)
     if not platform:
-        await update.message.reply_text("Faqat YouTube, Instagram yoki TikTok havolasi yuboring!")
+        await update.message.reply_text("Faqat Instagram, YouTube yoki TikTok havolasi yuboring!")
         return
+
     status = await update.message.reply_text(f"{platform} yuklanmoqda... kuting...")
-    path, err = await download_video(url, platform)
+    path, err = await download_video(url)
+
     if err:
         await status.edit_text(f"Xato: {err}")
         return
+
     await status.edit_text("Yuborilmoqda...")
     try:
         with open(path, "rb") as f:
-            await update.message.reply_video(video=f, caption=f"{platform} dan yuklandi!", supports_streaming=True, read_timeout=120, write_timeout=120)
+            await update.message.reply_video(
+                video=f,
+                caption=f"{platform} dan yuklandi!",
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+            )
         await status.delete()
     except Exception as e:
         await status.edit_text(f"Yuborishda xato: {e}")
@@ -103,13 +116,19 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             path.unlink(missing_ok=True)
 
 async def other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Faqat YouTube, Instagram yoki TikTok havolasi yuboring!")
+    await update.message.reply_text("Faqat Instagram, YouTube yoki TikTok havolasi yuboring!")
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("BOT_TOKEN ornatilmagan!")
         return
-    app = Application.builder().token(BOT_TOKEN).read_timeout(120).write_timeout(120).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(120)
+        .write_timeout(120)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"https?://"), handle))
     app.add_handler(MessageHandler(filters.ALL, other))
